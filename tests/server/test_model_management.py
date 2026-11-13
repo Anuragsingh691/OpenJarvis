@@ -313,3 +313,56 @@ class TestModelsEndpointExtended:
         assert resp.status_code == 200
         assert [m["id"] for m in resp.json()["data"]] == ["qwen3.5:4b"]
         mock_to_thread.assert_awaited_once_with(engine.list_models)
+
+
+# ---------------------------------------------------------------------------
+# Pull / delete when Ollama sits behind MultiEngine (other engines discovered)
+# ---------------------------------------------------------------------------
+
+
+def _multi_with_ollama(host="http://ollama.test:11434"):
+    """Mirror `jarvis serve` with a security profile and other engines found:
+    MultiEngine -> InstrumentedEngine -> GuardrailsEngine -> OllamaEngine."""
+    from openjarvis.core.events import EventBus
+    from openjarvis.engine.multi import MultiEngine
+    from openjarvis.engine.ollama import OllamaEngine
+    from openjarvis.security.guardrails import GuardrailsEngine
+    from openjarvis.telemetry.instrumented_engine import InstrumentedEngine
+
+    ollama = OllamaEngine(host=host)
+    ollama.list_models = MagicMock(return_value=["qwen3.5:9b"])
+    wrapped = InstrumentedEngine(GuardrailsEngine(ollama), EventBus())
+    nim = _make_engine(engine_id="nim", models=["meta/llama"])
+    return MultiEngine([("ollama", wrapped), ("nim", nim)])
+
+
+class TestModelManagementBehindMultiEngine:
+    def test_pull_reaches_wrapped_ollama(self):
+        client = TestClient(_app(_multi_with_ollama(), engine_name="multi"))
+        mock_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = MockClient.return_value.__aenter__.return_value
+            instance.post = AsyncMock(return_value=mock_resp)
+            resp = client.post("/v1/models/pull", json={"model": "gemma3:12b"})
+        assert resp.status_code == 200, resp.text
+        assert MockClient.call_args.kwargs["base_url"] == "http://ollama.test:11434"
+
+    def test_delete_reaches_wrapped_ollama(self):
+        client = TestClient(_app(_multi_with_ollama(), engine_name="multi"))
+        mock_resp = MagicMock(status_code=200, raise_for_status=MagicMock())
+        with patch("httpx.AsyncClient") as MockClient:
+            instance = MockClient.return_value.__aenter__.return_value
+            instance.request = AsyncMock(return_value=mock_resp)
+            resp = client.delete("/v1/models/gemma3:12b")
+        assert resp.status_code == 200, resp.text
+        assert MockClient.call_args.kwargs["base_url"] == "http://ollama.test:11434"
+
+    def test_multi_without_ollama_still_rejected(self):
+        from openjarvis.engine.multi import MultiEngine
+
+        multi = MultiEngine(
+            [("vllm", _make_engine("vllm")), ("nim", _make_engine("nim"))]
+        )
+        client = TestClient(_app(multi, engine_name="multi"))
+        assert client.post("/v1/models/pull", json={"model": "x"}).status_code == 501
+        assert client.delete("/v1/models/x").status_code == 501

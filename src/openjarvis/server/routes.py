@@ -1147,6 +1147,43 @@ async def list_models(request: Request) -> ModelListResponse:
     )
 
 
+def _find_ollama_engine(engine: Any, engine_name: str = "") -> Any:
+    """Return the Ollama engine serving requests, or None.
+
+    `jarvis serve` layers wrappers around the real engine -- GuardrailsEngine
+    (security profile), InstrumentedEngine (telemetry) and, when other backends
+    are discovered, MultiEngine -- so a top-level ``engine_id`` check misses
+    Ollama. Single-engine wrappers are unwrapped generically via their
+    ``_inner`` / ``_engine`` attribute so new wrappers keep working.
+    """
+    from openjarvis.engine._base import InferenceEngine
+    from openjarvis.engine.multi import MultiEngine
+
+    stack, seen = [engine], set()
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, MultiEngine):
+            stack.extend(inner for _key, inner in reversed(current._engines))
+            continue
+        inner = next(
+            (
+                value
+                for attr in ("_inner", "_engine")
+                if isinstance(value := getattr(current, attr, None), InferenceEngine)
+            ),
+            None,
+        )
+        if inner is not None:
+            stack.append(inner)
+        elif getattr(current, "engine_id", "") == "ollama":
+            return current
+    # Trust an explicit engine name even if the instance is opaque.
+    return engine if engine_name == "ollama" else None
+
+
 @router.post("/v1/models/pull")
 async def pull_model(request: Request):
     """Pull / download a model from the Ollama registry."""
@@ -1155,10 +1192,11 @@ async def pull_model(request: Request):
     if not model_name:
         raise HTTPException(status_code=400, detail="'model' field is required")
 
-    engine = request.app.state.engine
-    engine_name = getattr(request.app.state, "engine_name", "")
+    engine = _find_ollama_engine(
+        request.app.state.engine, getattr(request.app.state, "engine_name", "")
+    )
     # Only Ollama supports pulling
-    if engine_name != "ollama" and getattr(engine, "engine_id", "") != "ollama":
+    if engine is None:
         raise HTTPException(
             status_code=501,
             detail="Model pulling is only supported with the Ollama engine",
@@ -1188,9 +1226,10 @@ async def pull_model(request: Request):
 @router.delete("/v1/models/{model_name:path}")
 async def delete_model(model_name: str, request: Request):
     """Delete a model from Ollama."""
-    engine = request.app.state.engine
-    engine_name = getattr(request.app.state, "engine_name", "")
-    if engine_name != "ollama" and getattr(engine, "engine_id", "") != "ollama":
+    engine = _find_ollama_engine(
+        request.app.state.engine, getattr(request.app.state, "engine_name", "")
+    )
+    if engine is None:
         raise HTTPException(status_code=501, detail="Only supported with Ollama engine")
 
     import httpx as _httpx
