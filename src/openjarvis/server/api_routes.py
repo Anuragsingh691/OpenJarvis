@@ -1217,6 +1217,9 @@ async def speech_wake_stream(websocket: WebSocket):
         WakeSession,
         WakeWordDetector,
         WakeWordUnavailable,
+        make_vad_speech_check,
+        make_whisper_keyword_transcriber,
+        split_wake_phrase,
     )
 
     expected_key = getattr(websocket.app.state, "api_key", "")
@@ -1247,7 +1250,17 @@ async def speech_wake_stream(websocket: WebSocket):
         await websocket.close(code=1011)
         return
 
-    session = WakeSession(detector)
+    # A VAD, not loudness, decides when the request ends: noise bursts would
+    # otherwise end recording early and Whisper hallucinates text from noise.
+    is_speech = await asyncio.to_thread(make_vad_speech_check)
+    # Fallback for accents the pretrained wake model misses ("Hey Javis"):
+    # short phrases are checked with a small local Whisper model.
+    keyword_transcriber = await asyncio.to_thread(
+        make_whisper_keyword_transcriber, "base", language or "en"
+    )
+    session = WakeSession(
+        detector, is_speech=is_speech, keyword_transcriber=keyword_transcriber
+    )
     await websocket.send_json({"type": "ready", "wake_word": wake_word})
 
     try:
@@ -1276,6 +1289,13 @@ async def speech_wake_stream(websocket: WebSocket):
             samples = np.frombuffer(data, dtype="<i2")
             events = await asyncio.to_thread(session.feed, samples)
             for event in events:
+                logger.info("Wake-word session event: %s", event)
+                if event == "command":
+                    # Wake phrase + request in one breath: already transcribed.
+                    text = session.take_text() or ""
+                    logger.info("Wake-word transcript: %d chars", len(text))
+                    await websocket.send_json({"type": "transcript", "text": text})
+                    continue
                 if event != "utterance":
                     await websocket.send_json({"type": event})
                     continue
@@ -1286,12 +1306,17 @@ async def speech_wake_stream(websocket: WebSocket):
                         backend.transcribe, wav, format="wav", language=language
                     )
                     text = (result.text or "").strip()
+                    # "Hey Jarvis, what time is it" -> "what time is it".
+                    rest = split_wake_phrase(text)
+                    if rest is not None:
+                        text = rest
                 except Exception as exc:
                     logger.exception("Wake-word transcription failed")
                     await websocket.send_json(
                         {"type": "error", "detail": f"Transcription failed: {exc}"}
                     )
                     continue
+                logger.info("Wake-word transcript: %d chars", len(text))
                 await websocket.send_json({"type": "transcript", "text": text})
     except WebSocketDisconnect:
         pass

@@ -9,7 +9,9 @@ Requires the ``openwakeword`` package (``pip install 'OpenJarvis[voice]'``).
 
 from __future__ import annotations
 
+import re
 import threading
+from collections import deque
 from typing import Any, Callable, Optional
 
 SAMPLE_RATE = 16000
@@ -148,38 +150,90 @@ class WakeSession:
     * ``"wake"`` -- wake word heard, now recording
     * ``"utterance"`` -- recording finished; collect it with :meth:`take_wav`
     * ``"timeout"`` -- woke, but no speech followed; back to listening
+    * ``"command"`` -- wake phrase and request said in one breath (keyword
+      fallback only); collect the request text with :meth:`take_text`
+
+    With a ``keyword_transcriber``, short speech segments the wake model did
+    not fire on are transcribed and checked for the wake phrase. The
+    pretrained model is unreliable for some accents ("Hey Javis"), while a
+    small Whisper model prompted with the phrase recognizes them.
     """
 
     def __init__(
         self,
         detector: WakeWordDetector,
         *,
+        is_speech: Optional[Callable[[Any], bool]] = None,
         silence_threshold: float = 500.0,
         silence_seconds: float = 1.5,
         startup_silence_seconds: float = 5.0,
         max_seconds: float = 30.0,
+        min_speech_seconds: float = 0.24,
+        keyword_transcriber: Optional[Callable[[Any], str]] = None,
+        max_keyword_seconds: float = 8.0,
+        keyword_end_silence_seconds: float = 0.4,
+        rewake_max_seconds: float = 3.0,
     ) -> None:
         frames_per_second = SAMPLE_RATE / FRAME_SAMPLES
         self.detector = detector
         self.silence_threshold = silence_threshold
+        # Loudness is a poor speech test: noise bursts pass it and quiet,
+        # noise-suppressed browser speech fails it. Callers should inject a
+        # VAD (see make_vad_speech_check); RMS remains the fallback.
+        self._is_speech = is_speech or self._rms_is_speech
         self._silence_frames = max(1, int(silence_seconds * frames_per_second))
         self._startup_frames = max(1, int(startup_silence_seconds * frames_per_second))
         self._max_frames = max(1, int(max_seconds * frames_per_second))
+        self._min_speech_frames = max(1, round(min_speech_seconds * frames_per_second))
+        self._keyword_transcriber = keyword_transcriber
+        self._max_keyword_frames = max(1, int(max_keyword_seconds * frames_per_second))
+        self._keyword_end_frames = max(
+            1, round(keyword_end_silence_seconds * frames_per_second)
+        )
+        self._rewake_max_frames = max(1, int(rewake_max_seconds * frames_per_second))
+        self._preroll: deque = deque(maxlen=3)
+        self._kw_frames: Optional[list[Any]] = None
+        self._kw_speech = 0
+        self._kw_silence = 0
+        self._kw_too_long = False
+        self._text: Optional[str] = None
         self.state = "listening"
         self._pending: Any = None
         self._recorded: list[Any] = []
         self._utterance: Optional[bytes] = None
-        self._has_speech = False
+        self._speech_frames = 0
         self._silence_count = 0
+
+    def _rms_is_speech(self, frame: Any) -> bool:
+        import numpy as np
+
+        rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+        return rms > self.silence_threshold
+
+    @property
+    def _has_speech(self) -> bool:
+        return self._speech_frames >= self._min_speech_frames
 
     def reset(self) -> None:
         """Drop any partial audio and return to listening."""
         self.state = "listening"
         self._pending = None
         self._recorded = []
-        self._has_speech = False
+        self._speech_frames = 0
         self._silence_count = 0
+        self._reset_keyword()
         self.detector.reset()
+
+    def _reset_keyword(self) -> None:
+        self._kw_frames = None
+        self._kw_speech = 0
+        self._kw_silence = 0
+        self._kw_too_long = False
+
+    def take_text(self) -> Optional[str]:
+        """Return a one-breath request's text (once), or None."""
+        text, self._text = self._text, None
+        return text
 
     def take_wav(self) -> Optional[bytes]:
         """Return the finished utterance as WAV bytes (once), or None."""
@@ -196,46 +250,190 @@ class WakeSession:
         usable = len(samples) - len(samples) % FRAME_SAMPLES
         for start in range(0, usable, FRAME_SAMPLES):
             event = self._feed_frame(samples[start : start + FRAME_SAMPLES])
-            if event:
+            if isinstance(event, list):
+                events.extend(event)
+            elif event:
                 events.append(event)
         self._pending = samples[usable:]
         return events
 
-    def _feed_frame(self, frame: Any) -> Optional[str]:
+    def _start_recording(self) -> None:
+        self.detector.reset()
+        self._reset_keyword()
+        self.state = "recording"
+        self._recorded = []
+        self._speech_frames = 0
+        self._silence_count = 0
+
+    def _feed_frame(self, frame: Any) -> Any:
         import numpy as np
 
         if self.state == "listening":
             if self.detector.score(frame) >= self.detector.threshold:
-                self.detector.reset()
-                self.state = "recording"
-                self._recorded = []
-                self._has_speech = False
-                self._silence_count = 0
+                self._start_recording()
                 return "wake"
+            if self._keyword_transcriber is not None:
+                return self._keyword_frame(frame)
             return None
 
         self._recorded.append(frame.copy())
-        rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
-        if rms > self.silence_threshold:
-            self._has_speech = True
+        if self._is_speech(frame):
+            self._speech_frames += 1
             self._silence_count = 0
-        elif not self._has_speech:
-            if len(self._recorded) >= self._startup_frames:
-                self.reset()
-                return "timeout"
-        else:
+        elif self._speech_frames:
             self._silence_count += 1
+            if not self._has_speech and self._silence_count >= self._silence_frames:
+                # A blip too short to be a request (a cough, a click): forget
+                # it so the no-speech timeout still applies.
+                self._speech_frames = 0
+                self._silence_count = 0
 
-        if (self._has_speech and self._silence_count >= self._silence_frames) or (
-            len(self._recorded) >= self._max_frames
-        ):
+        ended = self._has_speech and self._silence_count >= self._silence_frames
+        if ended or len(self._recorded) >= self._max_frames:
             if not self._has_speech:
                 self.reset()
                 return "timeout"
-            self._utterance = _pcm_to_wav(np.concatenate(self._recorded))
+            audio = np.concatenate(self._recorded)
+            if self._is_repeated_wake_phrase(audio):
+                # The speaker repeated "Hey Jarvis" (often because they were
+                # unsure it heard them): wake again rather than send it.
+                self._start_recording()
+                return "wake"
+            self._utterance = _pcm_to_wav(audio)
             self.reset()
             return "utterance"
+        if not self._has_speech and len(self._recorded) >= self._startup_frames:
+            self.reset()
+            return "timeout"
         return None
+
+    def _is_repeated_wake_phrase(self, audio: Any) -> bool:
+        if self._keyword_transcriber is None:
+            return False
+        # Judge by how long they spoke, not the recording: a pause before the
+        # repeat is normal ("…nothing happened? Hey Jarvis").
+        if self._speech_frames > self._rewake_max_frames:
+            return False
+        try:
+            text = self._keyword_transcriber(audio) or ""
+        except Exception:
+            return False
+        return split_wake_phrase(text) == ""
+
+    def _keyword_frame(self, frame: Any) -> Any:
+        """Track one speech segment while listening; check it for the wake phrase."""
+        import numpy as np
+
+        speech = self._is_speech(frame)
+        if self._kw_frames is None:
+            if speech:
+                self._kw_frames = [*self._preroll, frame.copy()]
+                self._kw_speech, self._kw_silence = 1, 0
+            self._preroll.append(frame.copy())
+            return None
+
+        if not self._kw_too_long:
+            self._kw_frames.append(frame.copy())
+            if (
+                len(self._kw_frames)
+                > self._max_keyword_frames + self._keyword_end_frames
+            ):
+                # Ordinary conversation, not a wake phrase: stop buffering but keep
+                # tracking until the speaker pauses.
+                self._kw_too_long = True
+                self._kw_frames = []
+        if speech:
+            self._kw_speech += 1
+            self._kw_silence = 0
+        else:
+            self._kw_silence += 1
+        self._preroll.append(frame.copy())
+        if self._kw_silence < self._keyword_end_frames:
+            return None
+
+        frames, enough = self._kw_frames, self._kw_speech >= self._min_speech_frames
+        too_long = self._kw_too_long
+        self._reset_keyword()
+        if too_long or not enough:
+            return None
+        try:
+            text = self._keyword_transcriber(np.concatenate(frames)) or ""
+        except Exception:
+            return None
+        rest = split_wake_phrase(text)
+        if rest is None:
+            return None
+        if rest:
+            self._text = rest
+            self.detector.reset()
+            return ["wake", "command"]
+        self._start_recording()
+        return "wake"
+
+
+# Wake-name spellings Whisper produces for "Jarvis" across accents.
+_WAKE_PHRASE = re.compile(
+    r"^\W*(?:(?:hey|hi|hay|okay|ok)\W+)?"
+    r"(?:jarvis|javis|jarvas|jervis|jarves|jarvus|jarviz)\b\W*(.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def split_wake_phrase(text: str) -> Optional[str]:
+    """Return the request after a leading wake phrase, "" for the phrase alone,
+    or None when the text does not start with the wake phrase."""
+    match = _WAKE_PHRASE.match(text or "")
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def make_whisper_keyword_transcriber(
+    model_size: str = "base", language: Optional[str] = "en"
+) -> Optional[Callable[[Any], str]]:
+    """Return a fast local Whisper transcriber for wake-phrase checks, or None.
+
+    Prompting with the wake phrase biases recognition toward "Jarvis" for
+    speakers the pretrained wake model misses.
+    """
+    try:
+        from faster_whisper import WhisperModel
+
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+    except Exception:
+        return None
+
+    def transcribe(samples: Any) -> str:
+        audio = samples.astype("float32") / 32768.0
+        segments, _ = model.transcribe(
+            audio,
+            language=language,
+            beam_size=1,
+            without_timestamps=True,
+            initial_prompt="Hey Jarvis.",
+        )
+        return " ".join(seg.text.strip() for seg in segments).strip()
+
+    return transcribe
+
+
+def make_vad_speech_check(threshold: float = 0.5) -> Optional[Callable[[Any], bool]]:
+    """Return a Silero-VAD speech test for 80 ms frames, or None if unavailable.
+
+    openWakeWord bundles the Silero VAD ONNX model; each call returns whether
+    the frame's speech probability reaches ``threshold``.
+    """
+    try:
+        from openwakeword.vad import VAD
+
+        vad = VAD()
+    except Exception:
+        return None
+
+    def is_speech(frame: Any) -> bool:
+        return float(vad.predict(frame, frame_size=640)) >= threshold
+
+    return is_speech
 
 
 def _pcm_to_wav(samples: Any) -> bytes:
@@ -276,4 +474,7 @@ __all__ = [
     "WakeWordDetector",
     "WakeWordUnavailable",
     "chime",
+    "make_vad_speech_check",
+    "make_whisper_keyword_transcriber",
+    "split_wake_phrase",
 ]

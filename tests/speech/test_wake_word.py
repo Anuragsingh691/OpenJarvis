@@ -197,7 +197,9 @@ def test_session_reset_discards_recording():
 # --- /v1/speech/wake WebSocket ----------------------------------------------
 
 
-def _wake_client(monkeypatch, *, transcript="what time is it", backend=True):
+def _wake_client(
+    monkeypatch, *, transcript="what time is it", backend=True, vad=None, keyword=None
+):
     pytest.importorskip("fastapi")
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -206,6 +208,11 @@ def _wake_client(monkeypatch, *, transcript="what time is it", backend=True):
     from openjarvis.speech import wake_word
 
     monkeypatch.setattr(wake_word, "_load_model", lambda name: FakeModel())
+    # Synthetic tones aren't speech to a real VAD; use the RMS fallback.
+    monkeypatch.setattr(wake_word, "make_vad_speech_check", lambda: vad)
+    monkeypatch.setattr(
+        wake_word, "make_whisper_keyword_transcriber", lambda *a: keyword
+    )
     app = FastAPI()
     app.include_router(speech_router)
     app.state.config = SimpleNamespace(
@@ -266,3 +273,238 @@ def test_wake_socket_without_speech_backend(monkeypatch):
         msg = ws.receive_json()
         assert msg["type"] == "error"
         assert "Speech backend" in msg["detail"]
+
+
+# --- Noise after the wake word must not become a request -------------------
+
+
+def test_session_single_noise_burst_is_not_an_utterance():
+    """Regression: one loud noise frame after waking was sent as a request
+    (and Whisper hallucinated text from it)."""
+    session = _session(startup_silence_seconds=0.8, silence_seconds=0.24)
+    session.feed(_frame(7))
+    events = session.feed(np.concatenate([_quiet(2), _loud(1), _quiet(12)]))
+    assert events == ["timeout"]
+    assert session.take_wav() is None
+
+
+def test_session_uses_injected_speech_check():
+    """Speech is decided by the injected check (e.g. a VAD), not loudness."""
+    from openjarvis.speech.wake_word import WakeSession
+
+    is_speech = lambda frame: int(frame[1]) == 5  # noqa: E731
+    session = WakeSession(
+        WakeWordDetector(model=FakeModel()),
+        is_speech=is_speech,
+        silence_seconds=0.24,
+    )
+    session.feed(_frame(7))
+    speech = _quiet(4)
+    speech[1::FRAME_SAMPLES] = 5  # quiet but "speech" per the check
+    # Loud frames the check rejects are noise: still recording, no event.
+    assert session.feed(_loud(10)) == []
+    assert session.state == "recording"
+    assert session.feed(np.concatenate([speech, _quiet(3)])) == ["utterance"]
+
+
+def test_wake_socket_uses_vad_speech_check(monkeypatch):
+    """The server ends requests on VAD speech, so loud non-speech is ignored."""
+    calls = []
+
+    def vad(frame):
+        calls.append(1)
+        return False
+
+    client, transcribed = _wake_client(monkeypatch, vad=vad)
+    with client.websocket_connect("/v1/speech/wake") as ws:
+        ws.receive_json()
+        ws.send_bytes(_frame(7).tobytes())
+        assert ws.receive_json() == {"type": "wake"}
+        for _ in range(7):  # 5.6 s of loud audio the VAD rejects as non-speech
+            ws.send_bytes(_loud(10).tobytes())
+        assert ws.receive_json() == {"type": "timeout"}
+    assert calls and transcribed == []
+
+
+def test_vad_check_flags_real_speech_not_silence():
+    pytest.importorskip("openwakeword")
+    from openjarvis.speech.wake_word import make_vad_speech_check
+
+    is_speech = make_vad_speech_check()
+    assert is_speech is not None
+    assert is_speech(_quiet(1)) is False
+
+
+# --- Whisper fallback: accents the wake model misses ------------------------
+
+
+def _speech_marked(n_frames: int) -> np.ndarray:
+    """Frames the injected `_marker_speech` check treats as speech."""
+    frames = _quiet(n_frames)
+    frames[1::FRAME_SAMPLES] = 5
+    return frames
+
+
+def _marker_speech(frame) -> bool:
+    return int(frame[1]) == 5
+
+
+def _keyword_session(transcript, **kwargs):
+    from openjarvis.speech.wake_word import WakeSession
+
+    calls = []
+
+    def transcribe(samples):
+        calls.append(len(samples))
+        return transcript
+
+    session = WakeSession(
+        WakeWordDetector(model=FakeModel()),
+        is_speech=_marker_speech,
+        keyword_transcriber=transcribe,
+        **kwargs,
+    )
+    return session, calls
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Hey, Jarvis.", "hey javis", "Hey Jarvis!", "Okay Jervis.", "Jarvis?"],
+)
+def test_wake_phrase_variants_match(text):
+    from openjarvis.speech.wake_word import split_wake_phrase
+
+    assert split_wake_phrase(text) == ""
+
+
+@pytest.mark.parametrize(
+    "text, rest",
+    [
+        ("Hey Jarvis, what's the weather?", "what's the weather?"),
+        ("hey javis set a timer for five minutes", "set a timer for five minutes"),
+    ],
+)
+def test_wake_phrase_returns_request(text, rest):
+    from openjarvis.speech.wake_word import split_wake_phrase
+
+    assert split_wake_phrase(text) == rest
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "you", "Hey there.", "Travis is here", "I told Jarvis already", "Jarvisa"],
+)
+def test_non_wake_phrases_rejected(text):
+    from openjarvis.speech.wake_word import split_wake_phrase
+
+    assert split_wake_phrase(text) is None
+
+
+def test_keyword_fallback_wakes_on_missed_wake_word():
+    session, calls = _keyword_session("Hey, Javis.")
+    events = session.feed(np.concatenate([_quiet(3), _speech_marked(8), _quiet(6)]))
+    assert events == ["wake"]
+    assert session.state == "recording"
+    assert len(calls) == 1
+
+
+def test_keyword_fallback_one_breath_request():
+    session, _ = _keyword_session("Hey Jarvis, what's the weather?")
+    events = session.feed(np.concatenate([_speech_marked(20), _quiet(6)]))
+    assert events == ["wake", "command"]
+    assert session.take_text() == "what's the weather?"
+    assert session.take_text() is None
+    assert session.state == "listening"
+
+
+def test_keyword_fallback_ignores_other_speech():
+    session, calls = _keyword_session("Pass me the salt.")
+    assert session.feed(np.concatenate([_speech_marked(10), _quiet(6)])) == []
+    assert session.state == "listening"
+    assert len(calls) == 1
+
+
+def test_keyword_fallback_skips_long_speech():
+    session, calls = _keyword_session("Hey Jarvis", max_keyword_seconds=1.0)
+    session.feed(np.concatenate([_speech_marked(30), _quiet(6)]))
+    assert calls == []
+
+
+def test_keyword_fallback_skips_tiny_blips():
+    session, calls = _keyword_session("Hey Jarvis")
+    session.feed(np.concatenate([_speech_marked(1), _quiet(6)]))
+    assert calls == []
+
+
+def test_fast_path_does_not_call_transcriber():
+    session, calls = _keyword_session("Hey Jarvis")
+    assert session.feed(_frame(7)) == ["wake"]
+    assert calls == []
+
+
+def test_wake_socket_one_breath_command(monkeypatch):
+    """'Hey Javis, what's the time' -> keyword fallback sends the request."""
+    client, transcribed = _wake_client(
+        monkeypatch,
+        vad=_marker_speech,
+        keyword=lambda samples: "Hey Javis, what's the time?",
+    )
+    with client.websocket_connect("/v1/speech/wake") as ws:
+        ws.receive_json()
+        ws.send_bytes(_speech_marked(15).tobytes())
+        ws.send_bytes(_quiet(6).tobytes())
+        assert ws.receive_json() == {"type": "wake"}
+        assert ws.receive_json() == {"type": "transcript", "text": "what's the time?"}
+    assert transcribed == []  # no second transcription needed
+
+
+def test_repeated_wake_phrase_rewakes_instead_of_sending():
+    """Saying 'Hey Jarvis' again after the chime must not become the request."""
+    session, calls = _keyword_session("Hey Javis.", silence_seconds=0.24)
+    assert session.feed(_frame(7)) == ["wake"]
+    events = session.feed(np.concatenate([_speech_marked(10), _quiet(4)]))
+    assert events == ["wake"]
+    assert session.state == "recording"
+    assert session.take_wav() is None
+    assert len(calls) == 1
+
+
+def test_short_request_still_sent_after_wake_check():
+    session, _ = _keyword_session("What's the time?", silence_seconds=0.24)
+    session.feed(_frame(7))
+    events = session.feed(np.concatenate([_speech_marked(10), _quiet(4)]))
+    assert events == ["utterance"]
+    assert session.take_wav() is not None
+
+
+def test_long_request_skips_wake_check():
+    session, calls = _keyword_session(
+        "Hey Jarvis", silence_seconds=0.24, rewake_max_seconds=1.0
+    )
+    session.feed(_frame(7))
+    assert session.feed(np.concatenate([_speech_marked(20), _quiet(4)])) == [
+        "utterance"
+    ]
+    assert calls == []
+
+
+def test_socket_strips_leading_wake_phrase_from_request(monkeypatch):
+    client, _ = _wake_client(monkeypatch, transcript="Hey Jarvis, what time is it")
+    with client.websocket_connect("/v1/speech/wake") as ws:
+        ws.receive_json()
+        ws.send_bytes(_frame(7).tobytes())
+        assert ws.receive_json() == {"type": "wake"}
+        ws.send_bytes(_loud(3).tobytes())
+        ws.send_bytes(_quiet(20).tobytes())
+        assert ws.receive_json() == {"type": "transcribing"}
+        assert ws.receive_json() == {"type": "transcript", "text": "what time is it"}
+
+
+def test_rewake_after_long_pause_before_repeat():
+    """Regression (real capture): pause, then 'Hey Jarvis' again -> re-wake."""
+    session, _ = _keyword_session(
+        "Hey Javis.", silence_seconds=0.24, rewake_max_seconds=1.0
+    )
+    session.feed(_frame(7))
+    events = session.feed(np.concatenate([_quiet(30), _speech_marked(8), _quiet(4)]))
+    assert events == ["wake"]
