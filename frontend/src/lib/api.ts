@@ -1177,6 +1177,32 @@ export async function denyAction(actionId: string): Promise<void> {
   if (!res.ok) throw new Error(`Failed: ${res.status}`);
 }
 
+// Ask-before-use tool approvals for the chat agent ([tools] require_approval).
+export interface ToolApproval {
+  id: string;
+  tool: string;
+  summary: string;
+  arguments: Record<string, unknown>;
+  created_at: number;
+  expires_at: number;
+}
+
+export async function fetchToolApprovals(): Promise<ToolApproval[]> {
+  const res = await apiFetch(`/v1/tool-approvals/pending`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return data.approvals || [];
+}
+
+export async function decideToolApproval(id: string, approved: boolean): Promise<void> {
+  const res = await apiFetch(`/v1/tool-approvals/${encodeURIComponent(id)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ approved }),
+  });
+  if (!res.ok) throw new Error(`Failed: ${res.status}`);
+}
+
 // ---------------------------------------------------------------------------
 // Inference source (desktop only)
 // ---------------------------------------------------------------------------

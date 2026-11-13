@@ -212,6 +212,9 @@ class ToolExecutor:
         self._agent_id = agent_id
         self._boundary_guard = boundary_guard
         self._rate_limiter = rate_limiter
+        # Ask-before-use approval (see enable_approval). None = disabled.
+        self._approval_callback: Optional[Callable[[str, Dict[str, Any]], bool]] = None
+        self._approval_tools: frozenset[str] = frozenset()
         # Running taint accumulated across this executor's tool calls. Data
         # detected as PII/secret in one tool's output taints every later call,
         # so a sink-policy violation (e.g. secret -> http_request) is caught
@@ -223,6 +226,7 @@ class ToolExecutor:
             self._session_taint: Any = TaintSet()
         except Exception:
             self._session_taint = None
+
         self._taint_lock = threading.Lock()
         # Scan untrusted (non-local) tool output for prompt-injection before it
         # is handed back to the model. Off unless the scanner imports cleanly.
@@ -232,6 +236,22 @@ class ToolExecutor:
             self._injection_scanner: Any = InjectionScanner()
         except Exception:
             self._injection_scanner = None
+
+    def enable_approval(
+        self,
+        callback: Callable[[str, Dict[str, Any]], bool],
+        tools: Any = (),
+    ) -> None:
+        """Ask ``callback(tool_name, arguments)`` before running tools.
+
+        Applies to every name in ``tools`` (``"*"`` = all tools) plus any tool
+        whose spec requires confirmation. A falsy return or an exception
+        denies the call.
+        """
+        self._approval_callback = callback
+        self._approval_tools = frozenset(
+            str(t).strip() for t in tools if str(t).strip()
+        )
 
     def begin_session(self, content: List[str] | None = None) -> None:
         """Reset taint for one conversation and seed it from its history."""
@@ -397,8 +417,33 @@ class ToolExecutor:
         if isinstance(params, dict):
             params.pop("_taint", None)
 
+        # Ask-before-use approval: listed tools (or "*") and every tool that
+        # requires confirmation wait for the user's decision.
+        if self._approval_callback is not None and (
+            tool.spec.requires_confirmation
+            or "*" in self._approval_tools
+            or tool_call.name in self._approval_tools
+        ):
+            try:
+                approved = bool(
+                    self._approval_callback(
+                        tool_call.name, dict(params) if isinstance(params, dict) else {}
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Tool approval failed for %s: %s", tool_call.name, exc)
+                approved = False
+            if not approved:
+                return ToolResult(
+                    tool_name=tool_call.name,
+                    content=(
+                        f"Tool '{tool_call.name}' execution denied by user. "
+                        "Do not retry it; tell the user it was not allowed."
+                    ),
+                    success=False,
+                )
         # Confirmation check for sensitive tools
-        if tool.spec.requires_confirmation:
+        elif tool.spec.requires_confirmation:
             if not self._interactive or self._confirm_callback is None:
                 return ToolResult(
                     tool_name=tool_call.name,

@@ -292,6 +292,15 @@ def chat(
                     )
 
                 agent = agent_cls(engine, model, **kwargs)
+                from openjarvis.tools.approval import (
+                    apply_approval_from_config,
+                    terminal_approval_callback,
+                )
+
+                # [tools] require_approval: ask y/N before each listed tool.
+                apply_approval_from_config(
+                    agent, config, terminal_approval_callback(console)
+                )
                 from openjarvis.security.runtime import wire_agent_security
 
                 wire_agent_security(

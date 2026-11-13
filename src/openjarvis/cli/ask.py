@@ -513,6 +513,18 @@ def _run_agent(
         )
 
     agent = agent_cls(engine, model_name, **agent_kwargs)
+    # [tools] require_approval overrides the auto-approve above: ask y/N in
+    # the terminal, or deny when there is no terminal to ask.
+    from rich.console import Console as _ApprovalConsole
+
+    from openjarvis.tools.approval import (
+        apply_approval_from_config,
+        terminal_approval_callback,
+    )
+
+    apply_approval_from_config(
+        agent, config, terminal_approval_callback(_ApprovalConsole(stderr=True))
+    )
     from openjarvis.security.runtime import wire_agent_security
 
     wire_agent_security(

@@ -11,6 +11,7 @@ import {
   resolveChatEngine,
 } from '../../lib/chat-telemetry';
 import { MicButton } from './MicButton';
+import { ToolApprovalPrompt } from './ToolApprovalPrompt';
 import { useSpeech } from '../../hooks/useSpeech';
 import { useWakeWord, type WakeStatus } from '../../hooks/useWakeWord';
 import { useTtsStore } from '../../lib/tts';
@@ -614,6 +615,7 @@ export function InputArea() {
           </div>
         )}
       </div>
+      <ToolApprovalPrompt active={isCurrentChatStreaming} />
       <div
         className="flex items-center gap-2 rounded-2xl px-4 py-3 transition-shadow"
         style={{

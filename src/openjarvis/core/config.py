@@ -1126,6 +1126,11 @@ class ToolsConfig:
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     weather: WeatherToolConfig = field(default_factory=WeatherToolConfig)
     enabled: str = ""  # comma-separated default tools
+    # Ask-before-use: tools (list or comma-separated; "*" = all) that the
+    # server's chat agent may only run after the user approves in the GUI.
+    # Tools that require confirmation (e.g. shell_exec) ask too once set.
+    require_approval: str = ""
+    approval_timeout_seconds: float = 120.0  # unanswered requests are denied
 
 
 @dataclass

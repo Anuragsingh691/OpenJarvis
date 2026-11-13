@@ -20,10 +20,15 @@ default = "ollama"
 default_model = "qwen3.5:9b"
 
 [agent]
-default_agent = "simple"
+default_agent = "orchestrator"   # tool-using agent (the GUI server uses it too)
 
 [tools]
-enabled = ["code_interpreter", "web_search", "file_read", "shell_exec"]
+enabled = ["file_read", "file_write", "shell_exec", "code_interpreter", "web_search"]
+# Ask before use: Jarvis must get your OK (GUI Allow/Deny card, or a prompt in
+# `jarvis chat`) before every tool call. "*" = all tools; or list names, e.g.
+# ["file_read", "file_write", "shell_exec"] to let web searches run freely.
+require_approval = ["*"]
+approval_timeout_seconds = 120   # unanswered requests are denied
 
 [analytics]
 enabled = false

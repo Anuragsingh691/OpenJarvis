@@ -312,6 +312,7 @@ def serve(
     # (which would re-discover the engine, re-resolve tools, re-open the channel,
     # etc.). See the scheduler block near the bottom of this function (#263).
     resolved_tools: list = []
+    tool_approval_broker = None
     managed_mcp_tools: list = []
     mcp_clients: list = []
     try:
@@ -423,6 +424,24 @@ def serve(
                     rate_limiter=sec.rate_limiter,
                     agent_id=agent_key,
                 )
+                # Ask-before-use: the GUI shows Allow / Deny for listed tools.
+                from openjarvis.server.tool_approvals import (
+                    ToolApprovalBroker,
+                    enable_tool_approval,
+                    parse_tool_list,
+                )
+
+                approval_tools = parse_tool_list(config.tools.require_approval)
+                if approval_tools:
+                    broker = ToolApprovalBroker(
+                        timeout=config.tools.approval_timeout_seconds
+                    )
+                    if enable_tool_approval(agent, broker, approval_tools):
+                        tool_approval_broker = broker
+                        console.print(
+                            "  Tools:  [cyan]ask before use[/cyan] "
+                            f"({', '.join(approval_tools)})"
+                        )
                 # Pin MCP transports to the agent's lifetime so HTTP
                 # connections don't close mid-request (#461).
                 if mcp_clients:
@@ -772,6 +791,7 @@ def serve(
         webhook_config=webhook_config,
         cors_origins=cors_origins,
     )
+    app.state.tool_approvals = tool_approval_broker
 
     console.print(
         f"[green]Starting OpenJarvis API server[/green]\n"
