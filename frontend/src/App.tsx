@@ -13,6 +13,7 @@ import { SetupScreen } from './components/SetupScreen';
 import { Toaster } from './components/ui/sonner';
 import { useAppStore } from './lib/store';
 import { fetchModels, fetchServerInfo, fetchSavings, submitSavings, isTauri } from './lib/api';
+import { retryUntilSuccess } from './lib/retry';
 import { OptInModal } from './components/OptInModal';
 import { UpdateChecker } from './components/Desktop/UpdateChecker';
 import { track, hashId } from './lib/analytics';
@@ -71,12 +72,13 @@ export default function App() {
     if (!setupDone) return;
     let cancelled = false;
     setModelsLoading(true);
-    fetchModels()
+    // Retry: the browser can open before the API server is ready, and a
+    // single failed fetch left the chat stuck on "Pick a model first".
+    // Models already loaded by setup are kept until a fetch succeeds.
+    retryUntilSuccess(fetchModels, { isCancelled: () => cancelled })
       .then((m) => {
-        if (!cancelled) setModels(m);
+        if (!cancelled && m) setModels(m);
       })
-      // Preserve models already loaded by setup if this refresh fails.
-      .catch(() => {})
       .finally(() => {
         if (!cancelled) setModelsLoading(false);
       });
@@ -86,7 +88,11 @@ export default function App() {
   // Fetch server info
   useEffect(() => {
     if (!setupDone) return;
-    fetchServerInfo().then(setServerInfo).catch(() => {});
+    let cancelled = false;
+    retryUntilSuccess(fetchServerInfo, { isCancelled: () => cancelled }).then((info) => {
+      if (!cancelled && info) setServerInfo(info);
+    });
+    return () => { cancelled = true; };
   }, [setupDone, setServerInfo]);
 
   // Poll savings and optionally share to Supabase
