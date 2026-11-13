@@ -12,6 +12,8 @@ import {
 } from '../../lib/chat-telemetry';
 import { MicButton } from './MicButton';
 import { useSpeech } from '../../hooks/useSpeech';
+import { useWakeWord, type WakeStatus } from '../../hooks/useWakeWord';
+import { useTtsStore } from '../../lib/tts';
 import type {
   ChatMessage,
   MessageTelemetry,
@@ -90,6 +92,8 @@ export function InputArea() {
   const streamState = useAppStore((s) => s.streamState);
   const messages = useAppStore((s) => s.messages);
   const speechEnabled = useAppStore((s) => s.settings.speechEnabled);
+  const wakeWordEnabled = useAppStore((s) => s.settings.wakeWordEnabled);
+  const ttsState = useTtsStore((s) => s.state);
   const maxTokens = useAppStore((s) => s.settings.maxTokens);
   const temperature = useAppStore((s) => s.settings.temperature);
   const createConversation = useAppStore((s) => s.createConversation);
@@ -171,15 +175,16 @@ export function InputArea() {
     resetStream();
   }, [resetStream]);
 
-  const sendMessage = useCallback(async () => {
-    const content = input.trim();
+  // ``spoken`` sends a voice transcript directly, leaving any typed draft alone.
+  const sendMessage = useCallback(async (spoken?: string) => {
+    const content = (spoken ?? input).trim();
     if (!content || streamState.isStreaming) return;
     if (!selectedModel) {
       toast.error('Pick a model first (⌘K)');
       return;
     }
 
-    setInput('');
+    if (spoken === undefined) setInput('');
 
     let convId = activeId;
     if (!convId) {
@@ -554,6 +559,20 @@ export function InputArea() {
     maxTokens,
   ]);
 
+  const sendMessageRef = useRef(sendMessage);
+  sendMessageRef.current = sendMessage;
+  const wake = useWakeWord({
+    enabled: speechEnabled && wakeWordEnabled && speechAvailable,
+    // Withhold the mic while Jarvis is busy or talking so it can't wake itself.
+    paused:
+      streamState.isStreaming || ttsState !== 'idle' || speechState !== 'idle' || modelLoading,
+    onTranscript: (text) => void sendMessageRef.current(text),
+  });
+
+  useEffect(() => {
+    if (wake.error) toast.error(`Wake word: ${wake.error}`, { duration: 8000 });
+  }, [wake.error]);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -632,7 +651,7 @@ export function InputArea() {
               reason={micReason}
             />
             <button
-              onClick={sendMessage}
+              onClick={() => sendMessage()}
               disabled={streamState.isStreaming || !input.trim() || modelLoading || !selectedModel}
               title={selectedModel ? 'Send message' : 'Pick a model first (⌘K)'}
               className="p-2 rounded-xl transition-colors shrink-0 cursor-pointer disabled:opacity-30 disabled:cursor-default"
@@ -646,12 +665,40 @@ export function InputArea() {
           </div>
         )}
       </div>
-      <div className="flex items-center justify-center mt-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+      <div className="flex items-center justify-center gap-3 mt-2 text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
+        {wake.status !== 'off' && <WakeIndicator status={wake.status} />}
         <span>
           <kbd className="font-mono">Enter</kbd> to send &middot;{' '}
           <kbd className="font-mono">Shift+Enter</kbd> for new line
         </span>
       </div>
     </div>
+  );
+}
+
+const WAKE_LABELS: Record<Exclude<WakeStatus, 'off'>, string> = {
+  connecting: 'Starting wake word…',
+  listening: 'Say “Hey Jarvis”',
+  recording: 'Listening…',
+  transcribing: 'Transcribing…',
+  error: 'Wake word unavailable',
+};
+
+function WakeIndicator({ status }: { status: Exclude<WakeStatus, 'off'> }) {
+  const active = status === 'recording' || status === 'transcribing';
+  const color = status === 'error'
+    ? 'var(--color-error)'
+    : active ? 'var(--color-accent)' : 'var(--color-text-tertiary)';
+  return (
+    <span className="inline-flex items-center gap-1.5" role="status" aria-live="polite" style={{ color }}>
+      <span
+        className="inline-block w-1.5 h-1.5 rounded-full"
+        style={{
+          background: color,
+          animation: active ? 'pulse 1.5s ease-in-out infinite' : 'none',
+        }}
+      />
+      {WAKE_LABELS[status]}
+    </span>
   );
 }

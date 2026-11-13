@@ -108,6 +108,8 @@ interface Settings {
   speechEnabled: boolean;
   voiceOutputEnabled: boolean;
   voiceAutoplay: boolean;
+  // Hands-free "Hey Jarvis": stream the mic to /v1/speech/wake while idle.
+  wakeWordEnabled: boolean;
 }
 
 function loadSettings(): Settings {
@@ -123,6 +125,7 @@ function loadSettings(): Settings {
     speechEnabled: false,
     voiceOutputEnabled: false,
     voiceAutoplay: false,
+    wakeWordEnabled: false,
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);

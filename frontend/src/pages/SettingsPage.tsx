@@ -801,6 +801,27 @@ export function SettingsPage() {
                 />
               </button>
             </SettingRow>
+            <SettingRow label="&quot;Hey Jarvis&quot; wake word" description="Listen hands-free: say “Hey Jarvis”, then your request — it is sent when you pause. Audio is processed by your local server only.">
+              <button
+                onClick={() => { updateSettings({ wakeWordEnabled: !settings.wakeWordEnabled }); showSaved(); }}
+                disabled={!settings.speechEnabled}
+                aria-label="Toggle Hey Jarvis wake word"
+                className="relative w-11 h-6 rounded-full transition-colors cursor-pointer"
+                style={{
+                  background: settings.wakeWordEnabled && settings.speechEnabled ? 'var(--color-accent)' : 'var(--color-bg-tertiary)',
+                  opacity: settings.speechEnabled ? 1 : 0.4,
+                  cursor: settings.speechEnabled ? 'pointer' : 'default',
+                }}
+              >
+                <span
+                  className="absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform bg-white"
+                  style={{
+                    transform: settings.wakeWordEnabled && settings.speechEnabled ? 'translateX(20px)' : 'translateX(0)',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
+                  }}
+                />
+              </button>
+            </SettingRow>
             <SettingRow label="Text-to-Speech" description="Show a read-aloud button on assistant replies">
               <button
                 onClick={() => { updateSettings({ voiceOutputEnabled: !settings.voiceOutputEnabled }); showSaved(); }}

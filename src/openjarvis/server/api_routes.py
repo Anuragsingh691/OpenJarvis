@@ -1190,6 +1190,113 @@ async def tts_health(request: Request):
     }
 
 
+# One 16 kHz int16 frame is 2560 bytes; this leaves room for browser buffering
+# while bounding what a single message can make the server hold.
+_WAKE_MAX_MESSAGE_BYTES = 64 * 1024
+
+
+@speech_router.websocket("/wake")
+async def speech_wake_stream(websocket: WebSocket):
+    """Hands-free "Hey Jarvis": wake-word detection over streamed mic audio.
+
+    The client sends binary messages of 16 kHz mono little-endian int16 PCM,
+    and may send ``{"type": "reset"}`` to discard buffered audio (e.g. after
+    pausing the mic while a reply plays). The server replies with JSON events:
+
+        {"type": "ready", "wake_word": "hey_jarvis"}
+        {"type": "wake"}                     -- wake word heard, recording
+        {"type": "transcribing"}             -- speaker paused
+        {"type": "transcript", "text": "..."}
+        {"type": "timeout"}                  -- woke, but nothing was said
+        {"type": "error", "detail": "..."}
+    """
+    import numpy as np
+
+    from openjarvis.server.auth_middleware import authenticate_websocket
+    from openjarvis.speech.wake_word import (
+        WakeSession,
+        WakeWordDetector,
+        WakeWordUnavailable,
+    )
+
+    expected_key = getattr(websocket.app.state, "api_key", "")
+    authorized, subprotocol = authenticate_websocket(websocket, expected_key)
+    if not authorized:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept(subprotocol=subprotocol)
+
+    backend = getattr(websocket.app.state, "speech_backend", None)
+    if backend is None:
+        await websocket.send_json(
+            {"type": "error", "detail": "Speech backend not configured"}
+        )
+        await websocket.close(code=1011)
+        return
+
+    speech_cfg = getattr(getattr(websocket.app.state, "config", None), "speech", None)
+    wake_word = getattr(speech_cfg, "wake_word", "") or "hey_jarvis"
+    threshold = float(getattr(speech_cfg, "wake_threshold", 0.5))
+    language = (getattr(speech_cfg, "language", "") or "").strip() or None
+
+    try:
+        detector = WakeWordDetector(wake_word, threshold)
+        await asyncio.to_thread(lambda: detector.model)
+    except (WakeWordUnavailable, ValueError) as exc:
+        await websocket.send_json({"type": "error", "detail": str(exc)})
+        await websocket.close(code=1011)
+        return
+
+    session = WakeSession(detector)
+    await websocket.send_json({"type": "ready", "wake_word": wake_word})
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            if message.get("text") is not None:
+                try:
+                    control = json.loads(message["text"])
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(control, dict) and control.get("type") == "reset":
+                    session.reset()
+                continue
+
+            data = message.get("bytes")
+            if not data:
+                continue
+            if len(data) > _WAKE_MAX_MESSAGE_BYTES or len(data) % 2:
+                await websocket.send_json(
+                    {"type": "error", "detail": "Invalid audio frame"}
+                )
+                continue
+
+            samples = np.frombuffer(data, dtype="<i2")
+            events = await asyncio.to_thread(session.feed, samples)
+            for event in events:
+                if event != "utterance":
+                    await websocket.send_json({"type": event})
+                    continue
+                wav = session.take_wav()
+                await websocket.send_json({"type": "transcribing"})
+                try:
+                    result = await asyncio.to_thread(
+                        backend.transcribe, wav, format="wav", language=language
+                    )
+                    text = (result.text or "").strip()
+                except Exception as exc:
+                    logger.exception("Wake-word transcription failed")
+                    await websocket.send_json(
+                        {"type": "error", "detail": f"Transcription failed: {exc}"}
+                    )
+                    continue
+                await websocket.send_json({"type": "transcript", "text": text})
+    except WebSocketDisconnect:
+        pass
+
+
 # ---- Feedback routes ----
 
 feedback_router = APIRouter(prefix="/v1/feedback", tags=["feedback"])

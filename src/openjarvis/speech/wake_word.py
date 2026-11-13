@@ -136,6 +136,121 @@ class WakeWordDetector:
         return False
 
 
+class WakeSession:
+    """Push-based wake-then-record state machine for streamed audio.
+
+    Callers feed 16 kHz int16 frames (any length; they are re-chunked to
+    :data:`FRAME_SAMPLES`). In ``listening`` state frames are scored for the
+    wake word; after an activation the session records until the speaker
+    pauses, mirroring ``voice_io.record_until_silence``. :meth:`feed` returns
+    the events raised by the frames it consumed:
+
+    * ``"wake"`` -- wake word heard, now recording
+    * ``"utterance"`` -- recording finished; collect it with :meth:`take_wav`
+    * ``"timeout"`` -- woke, but no speech followed; back to listening
+    """
+
+    def __init__(
+        self,
+        detector: WakeWordDetector,
+        *,
+        silence_threshold: float = 500.0,
+        silence_seconds: float = 1.5,
+        startup_silence_seconds: float = 5.0,
+        max_seconds: float = 30.0,
+    ) -> None:
+        frames_per_second = SAMPLE_RATE / FRAME_SAMPLES
+        self.detector = detector
+        self.silence_threshold = silence_threshold
+        self._silence_frames = max(1, int(silence_seconds * frames_per_second))
+        self._startup_frames = max(1, int(startup_silence_seconds * frames_per_second))
+        self._max_frames = max(1, int(max_seconds * frames_per_second))
+        self.state = "listening"
+        self._pending: Any = None
+        self._recorded: list[Any] = []
+        self._utterance: Optional[bytes] = None
+        self._has_speech = False
+        self._silence_count = 0
+
+    def reset(self) -> None:
+        """Drop any partial audio and return to listening."""
+        self.state = "listening"
+        self._pending = None
+        self._recorded = []
+        self._has_speech = False
+        self._silence_count = 0
+        self.detector.reset()
+
+    def take_wav(self) -> Optional[bytes]:
+        """Return the finished utterance as WAV bytes (once), or None."""
+        wav, self._utterance = self._utterance, None
+        return wav
+
+    def feed(self, samples: Any) -> list[str]:
+        import numpy as np
+
+        samples = np.asarray(samples, dtype=np.int16)
+        if self._pending is not None and len(self._pending):
+            samples = np.concatenate([self._pending, samples])
+        events: list[str] = []
+        usable = len(samples) - len(samples) % FRAME_SAMPLES
+        for start in range(0, usable, FRAME_SAMPLES):
+            event = self._feed_frame(samples[start : start + FRAME_SAMPLES])
+            if event:
+                events.append(event)
+        self._pending = samples[usable:]
+        return events
+
+    def _feed_frame(self, frame: Any) -> Optional[str]:
+        import numpy as np
+
+        if self.state == "listening":
+            if self.detector.score(frame) >= self.detector.threshold:
+                self.detector.reset()
+                self.state = "recording"
+                self._recorded = []
+                self._has_speech = False
+                self._silence_count = 0
+                return "wake"
+            return None
+
+        self._recorded.append(frame.copy())
+        rms = float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+        if rms > self.silence_threshold:
+            self._has_speech = True
+            self._silence_count = 0
+        elif not self._has_speech:
+            if len(self._recorded) >= self._startup_frames:
+                self.reset()
+                return "timeout"
+        else:
+            self._silence_count += 1
+
+        if (self._has_speech and self._silence_count >= self._silence_frames) or (
+            len(self._recorded) >= self._max_frames
+        ):
+            if not self._has_speech:
+                self.reset()
+                return "timeout"
+            self._utterance = _pcm_to_wav(np.concatenate(self._recorded))
+            self.reset()
+            return "utterance"
+        return None
+
+
+def _pcm_to_wav(samples: Any) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(samples.astype("<i2").tobytes())
+    return buf.getvalue()
+
+
 def chime(sample_rate: int = 24000) -> None:
     """Play a short two-tone cue confirming the wake word was heard."""
     try:
@@ -157,6 +272,7 @@ __all__ = [
     "DEFAULT_WAKE_WORD",
     "FRAME_SAMPLES",
     "SAMPLE_RATE",
+    "WakeSession",
     "WakeWordDetector",
     "WakeWordUnavailable",
     "chime",

@@ -132,3 +132,137 @@ def test_chat_exposes_wake_word_flag():
 
     result = CliRunner().invoke(chat, ["--help"])
     assert "--wake-word" in result.output
+
+
+# --- WakeSession: streamed wake -> record -> utterance state machine ---------
+
+
+def _loud(n_frames: int = 1) -> np.ndarray:
+    return np.full(FRAME_SAMPLES * n_frames, 3000, dtype=np.int16)
+
+
+def _quiet(n_frames: int = 1) -> np.ndarray:
+    return np.zeros(FRAME_SAMPLES * n_frames, dtype=np.int16)
+
+
+def _session(**kwargs):
+    from openjarvis.speech.wake_word import WakeSession
+
+    return WakeSession(WakeWordDetector(model=FakeModel()), **kwargs)
+
+
+def test_session_wake_then_utterance_on_silence():
+    session = _session(silence_seconds=0.24)  # 3 frames
+    assert session.feed(_quiet(2)) == []
+    assert session.feed(_frame(7)) == ["wake"]
+    assert session.state == "recording"
+    assert session.feed(_loud(5)) == []
+    assert session.feed(_quiet(3)) == ["utterance"]
+    assert session.state == "listening"
+    wav = session.take_wav()
+    assert wav[:4] == b"RIFF"
+    assert session.take_wav() is None
+
+
+def test_session_rechunks_partial_frames():
+    session = _session()
+    frame = _frame(7)
+    assert session.feed(frame[:500]) == []
+    assert session.feed(frame[500:]) == ["wake"]
+
+
+def test_session_times_out_without_speech():
+    session = _session(startup_silence_seconds=0.4)  # 5 frames
+    assert session.feed(_frame(7)) == ["wake"]
+    assert session.feed(_quiet(5)) == ["timeout"]
+    assert session.state == "listening"
+    assert session.take_wav() is None
+
+
+def test_session_caps_recording_length():
+    session = _session(max_seconds=0.4)
+    session.feed(_frame(7))
+    assert session.feed(_loud(5)) == ["utterance"]
+
+
+def test_session_reset_discards_recording():
+    session = _session()
+    session.feed(_frame(7))
+    session.feed(_loud(2))
+    session.reset()
+    assert session.state == "listening"
+    assert session.feed(_quiet(30)) == []
+
+
+# --- /v1/speech/wake WebSocket ----------------------------------------------
+
+
+def _wake_client(monkeypatch, *, transcript="what time is it", backend=True):
+    pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from openjarvis.server.api_routes import speech_router
+    from openjarvis.speech import wake_word
+
+    monkeypatch.setattr(wake_word, "_load_model", lambda name: FakeModel())
+    app = FastAPI()
+    app.include_router(speech_router)
+    app.state.config = SimpleNamespace(
+        speech=SimpleNamespace(wake_word="hey_jarvis", wake_threshold=0.5, language="")
+    )
+    transcribed: list[bytes] = []
+
+    def transcribe(audio, **kwargs):
+        transcribed.append(audio)
+        return SimpleNamespace(text=transcript)
+
+    app.state.speech_backend = (
+        SimpleNamespace(backend_id="fake", transcribe=transcribe) if backend else None
+    )
+    return TestClient(app), transcribed
+
+
+def test_wake_socket_full_flow(monkeypatch):
+    client, transcribed = _wake_client(monkeypatch)
+    with client.websocket_connect("/v1/speech/wake") as ws:
+        assert ws.receive_json() == {"type": "ready", "wake_word": "hey_jarvis"}
+        ws.send_bytes(_frame(7).tobytes())
+        assert ws.receive_json() == {"type": "wake"}
+        ws.send_bytes(_loud(3).tobytes())
+        ws.send_bytes(_quiet(20).tobytes())
+        assert ws.receive_json() == {"type": "transcribing"}
+        assert ws.receive_json() == {"type": "transcript", "text": "what time is it"}
+    assert len(transcribed) == 1 and transcribed[0][:4] == b"RIFF"
+
+
+def test_wake_socket_reset_control(monkeypatch):
+    client, transcribed = _wake_client(monkeypatch)
+    with client.websocket_connect("/v1/speech/wake") as ws:
+        ws.receive_json()
+        ws.send_bytes(_frame(7).tobytes())
+        assert ws.receive_json() == {"type": "wake"}
+        ws.send_bytes(_loud(3).tobytes())
+        ws.send_json({"type": "reset"})
+        ws.send_bytes(_quiet(20).tobytes())
+        ws.send_bytes(_frame(7).tobytes())
+        assert ws.receive_json() == {"type": "wake"}
+    assert transcribed == []
+
+
+def test_wake_socket_rejects_bad_frames(monkeypatch):
+    client, _ = _wake_client(monkeypatch)
+    with client.websocket_connect("/v1/speech/wake") as ws:
+        ws.receive_json()
+        ws.send_bytes(b"\x00\x01\x02")
+        assert ws.receive_json()["type"] == "error"
+        ws.send_bytes(b"\x00" * (64 * 1024 + 2))
+        assert ws.receive_json()["type"] == "error"
+
+
+def test_wake_socket_without_speech_backend(monkeypatch):
+    client, _ = _wake_client(monkeypatch, backend=False)
+    with client.websocket_connect("/v1/speech/wake") as ws:
+        msg = ws.receive_json()
+        assert msg["type"] == "error"
+        assert "Speech backend" in msg["detail"]
