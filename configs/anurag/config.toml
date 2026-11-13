@@ -1,0 +1,43 @@
+# Anurag's OpenJarvis configuration
+#
+# Installed to ~/.openjarvis/config.toml by scripts/setup-anurag.sh.
+# Tuned for an Apple Silicon Mac with 24 GB of unified memory.
+# Full reference config: jarvis init --full
+
+[engine]
+default = "ollama"
+
+[engine.ollama]
+# host = "http://localhost:11434"  # set to remote URL if engine runs elsewhere
+
+[intelligence]
+# Local models pulled by the setup script:
+#   qwen3.5:9b  - default all-rounder
+#   qwen3:14b   - stronger reasoning / planning
+#   gemma3:12b  - writing, summaries, multilingual, images
+#   qwen3.5:4b  - fast replies (good for voice)
+#   qwen3:0.6b  - tiny starter model
+default_model = "qwen3.5:9b"
+
+[agent]
+default_agent = "simple"
+
+[tools]
+enabled = ["code_interpreter", "web_search", "file_read", "shell_exec"]
+
+[analytics]
+enabled = false
+choice_recorded = true
+
+[security]
+profile = "personal"
+
+[speech]
+backend = "faster-whisper"   # local speech-to-text
+model = "small"              # whisper size: tiny/base/small/medium/large-v3
+compute_type = "int8"        # float16 unsupported on Mac CPU
+tts_backend = "kokoro"       # local text-to-speech
+voice_id = "bm_george"       # British male; try af_heart, bf_emma, am_adam
+voice_speed = 1.0
+wake_word = "hey_jarvis"     # say "Hey Jarvis" (GUI toggle, or `jarvis chat --wake-word`)
+wake_threshold = 0.5         # raise (e.g. 0.7) if it false-triggers, lower (0.3) if it misses you
