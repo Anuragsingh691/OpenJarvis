@@ -1636,6 +1636,11 @@ class SpeechConfig:
     tts_backend: str = "kokoro"  # "kokoro", "openai_tts", "cartesia", "elevenlabs"
     voice_id: str = "bm_george"
     voice_speed: float = 1.0
+    # Wake word for ``jarvis chat --wake-word`` (openWakeWord pretrained model
+    # name) and its activation score threshold in (0, 1); raise it if Jarvis
+    # wakes on its own, lower it if it misses you.
+    wake_word: str = "hey_jarvis"
+    wake_threshold: float = 0.5
 
 
 @dataclass(slots=True)

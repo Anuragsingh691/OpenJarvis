@@ -46,6 +46,7 @@ class VoiceSession:
         self._tts_attempted: set[str] = set()
         self._voice_prefs: tuple[str, str, float] | None = None
         self._voice_warned: set[str] = set()
+        self._wake_detector: Any = None
 
     def get_stt_backend(self) -> Any:
         """Resolve and health-check STT once, then reuse the loaded backend."""
@@ -111,6 +112,20 @@ class VoiceSession:
             )
         return substitute, speed
 
+    def get_wake_detector(self) -> Any:
+        """Build the configured wake-word detector once per session."""
+        if self._wake_detector is None:
+            from openjarvis.core.config import load_config
+            from openjarvis.speech.wake_word import WakeWordDetector
+
+            config = self._config if self._config is not None else load_config()
+            speech = getattr(config, "speech", None)
+            self._wake_detector = WakeWordDetector(
+                getattr(speech, "wake_word", "") or "hey_jarvis",
+                float(getattr(speech, "wake_threshold", 0.5)),
+            )
+        return self._wake_detector
+
     def discard_tts_backend(self) -> None:
         """Forget a backend that failed synthesis and allow the next fallback."""
         self._tts_backend = None
@@ -173,6 +188,39 @@ def record_voice(
         return None
 
 
+def wait_for_wake_word(
+    console: Any,
+    session: VoiceSession,
+    detector: Any = None,
+) -> Optional[str] | object:
+    """Idle until the wake word is heard, chime, then record one utterance."""
+    from openjarvis.speech.wake_word import WakeWordUnavailable, chime
+
+    if detector is None:
+        detector = session.get_wake_detector()
+    console.print(
+        f"[dim cyan]Waiting for wake word "
+        f"'{_terminal_safe_text(detector.wake_word.replace('_', ' '))}'… "
+        f"(Ctrl-C to quit)[/dim cyan]"
+    )
+    try:
+        if not detector.wait():
+            return VOICE_EXIT
+    except KeyboardInterrupt:
+        return VOICE_EXIT
+    except WakeWordUnavailable as exc:
+        console.print(f"[red]{_terminal_safe_text(exc)}[/red]")
+        return VOICE_EXIT
+    except Exception as exc:
+        console.print(f"[red]Mic error: {_terminal_safe_text(exc)}[/red]")
+        return VOICE_EXIT
+    try:
+        chime()
+    except Exception:
+        pass  # the cue is cosmetic; never block the request on it
+    return record_voice(console, session)
+
+
 def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
     """Synthesize and play text, reusing a healthy backend for the session."""
     from openjarvis.speech.voice_io import play_wav
@@ -211,4 +259,11 @@ def speak(text: str, console: Any, session: VoiceSession | None = None) -> None:
     )
 
 
-__all__ = ["VOICE_EXIT", "VoiceSession", "read_voice_input", "record_voice", "speak"]
+__all__ = [
+    "VOICE_EXIT",
+    "VoiceSession",
+    "read_voice_input",
+    "record_voice",
+    "speak",
+    "wait_for_wake_word",
+]
